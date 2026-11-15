@@ -12,6 +12,9 @@ import {
 
 import { db } from "./firebase";
 
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js";
+
 // Every collection belongs to one organisation.
 function orgCollection(orgId, collectionName) {
   return collection(db, "organizations", orgId, collectionName);
@@ -93,12 +96,20 @@ export async function addProcessor(orgId, processorData) {
   });
 }
 
-// Register a certificate entered by the organisation.
-export async function addCertificate(orgId, certificateData) {
-  const certificateNumber = certificateData.certificateNumber.trim();
-  const quantity = Number(certificateData.quantity);
 
-  if (!certificateNumber || !certificateData.issuer.trim()) {
+// Register a certificate with a transaction-based unique index.
+export async function addCertificate(orgId, certificateData) {
+  if (!orgId) {
+    throw new Error("Organisation ID is required.");
+  }
+
+  const certificateNumber = certificateData.certificateNumber.trim();
+  const certificateNumberLower = certificateNumber.toLowerCase();
+  const issuer = certificateData.issuer.trim();
+  const quantity = Number(certificateData.quantity);
+  const complianceYear = Number(certificateData.complianceYear);
+
+  if (!certificateNumber || !issuer) {
     throw new Error("Certificate number and issuer are required.");
   }
 
@@ -106,33 +117,54 @@ export async function addCertificate(orgId, certificateData) {
     throw new Error("Certificate quantity must be greater than zero.");
   }
 
-  const certificatesRef = orgCollection(orgId, "certificates");
-
-  const existing = await getDocs(
-    query(certificatesRef)
-  );
-
-  const duplicate = existing.docs.some(
-    (item) =>
-      item.data().certificateNumberLower === certificateNumber.toLowerCase()
-  );
-
-  if (duplicate) {
-    throw new Error("A certificate with this number is already registered.");
+  if (!Number.isInteger(complianceYear)) {
+    throw new Error("A valid compliance year is required.");
   }
 
-  return addDoc(certificatesRef, {
-    certificateNumber,
-    certificateNumberLower: certificateNumber.toLowerCase(),
-    issuer: certificateData.issuer.trim(),
-    issueDate: certificateData.issueDate,
-    complianceYear: Number(certificateData.complianceYear),
-    quantity,
-    reference: certificateData.reference.trim(),
-    notes: certificateData.notes.trim(),
-    createdAt: serverTimestamp(),
+  const normalizedBytes = utf8ToBytes(certificateNumberLower);
+  const certificateIndexId = bytesToHex(sha256(normalizedBytes));
+
+  const certificateRef = doc(orgCollection(orgId, "certificates"));
+  const indexRef = doc(
+    db,
+    "organizations",
+    orgId,
+    "certificateIndexes",
+    certificateIndexId
+  );
+
+  return runTransaction(db, async (transaction) => {
+    const indexSnapshot = await transaction.get(indexRef);
+
+    if (indexSnapshot.exists()) {
+      throw new Error(
+        "A certificate with this number is already registered."
+      );
+    }
+
+    transaction.set(certificateRef, {
+      certificateNumber,
+      certificateNumberLower,
+      certificateIndexId,
+      issuer,
+      issueDate: certificateData.issueDate,
+      complianceYear,
+      quantity,
+      reference: certificateData.reference.trim(),
+      notes: certificateData.notes.trim(),
+      createdAt: serverTimestamp(),
+    });
+
+    transaction.set(indexRef, {
+      certificateId: certificateRef.id,
+      certificateNumberLower,
+      createdAt: serverTimestamp(),
+    });
+
+    return certificateRef;
   });
 }
+
 
 // Record a pickup and update the waste record atomically.
 export async function recordPickup(orgId, pickupData) {

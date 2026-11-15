@@ -36,6 +36,14 @@ service cloud.firestore {
       return /databases/$(database)/documents/organizations/$(orgId)/collections/$(collectionId);
     }
 
+    function certificatePath(orgId, certificateId) {
+      return /databases/$(database)/documents/organizations/$(orgId)/certificates/$(certificateId);
+    }
+
+    function certificateIndexPath(orgId, indexId) {
+      return /databases/$(database)/documents/organizations/$(orgId)/certificateIndexes/$(indexId);
+    }
+
     function isMember(orgId) {
       return signedIn()
         && exists(memberPath(orgId, request.auth.uid));
@@ -106,7 +114,6 @@ service cloud.firestore {
 
         allow read: if isMember(orgId);
 
-        // Member management will use a separately secured invitation flow.
         allow update, delete: if false;
       }
 
@@ -146,7 +153,6 @@ service cloud.firestore {
           && request.resource.data.notes is string
           && request.resource.data.createdAt is timestamp;
 
-        // Only a valid pickup transaction can update collected quantity.
         allow update: if isMember(orgId)
           && request.resource.data.diff(resource.data)
             .affectedKeys().hasOnly([
@@ -236,8 +242,6 @@ service cloud.firestore {
 
         allow read: if isMember(orgId);
 
-        // A collection must be created together with
-        // the matching waste-record update.
         allow create: if isMember(orgId)
           && request.resource.data.keys().hasOnly([
             "wasteRecordId",
@@ -311,7 +315,6 @@ service cloud.firestore {
               request.resource.data.wasteRecordId
             )).data.collectedAmount + request.resource.data.amount;
 
-        // Historical pickup entries are immutable.
         allow update, delete: if false;
       }
 
@@ -327,6 +330,7 @@ service cloud.firestore {
           && request.resource.data.keys().hasOnly([
             "certificateNumber",
             "certificateNumberLower",
+            "certificateIndexId",
             "issuer",
             "issueDate",
             "complianceYear",
@@ -338,6 +342,7 @@ service cloud.firestore {
           && request.resource.data.keys().hasAll([
             "certificateNumber",
             "certificateNumberLower",
+            "certificateIndexId",
             "issuer",
             "issueDate",
             "complianceYear",
@@ -351,6 +356,8 @@ service cloud.firestore {
           && request.resource.data.certificateNumberLower is string
           && request.resource.data.certificateNumberLower ==
             request.resource.data.certificateNumber.lower()
+          && request.resource.data.certificateIndexId is string
+          && request.resource.data.certificateIndexId.size() == 64
           && request.resource.data.issuer is string
           && request.resource.data.issuer.size() > 0
           && request.resource.data.issueDate is string
@@ -359,9 +366,61 @@ service cloud.firestore {
           && request.resource.data.quantity > 0
           && request.resource.data.reference is string
           && request.resource.data.notes is string
-          && request.resource.data.createdAt is timestamp;
+          && request.resource.data.createdAt is timestamp
+          && existsAfter(certificateIndexPath(
+            orgId,
+            request.resource.data.certificateIndexId
+          ))
+          && getAfter(certificateIndexPath(
+            orgId,
+            request.resource.data.certificateIndexId
+          )).data.certificateId == certificateId
+          && getAfter(certificateIndexPath(
+            orgId,
+            request.resource.data.certificateIndexId
+          )).data.certificateNumberLower ==
+            request.resource.data.certificateNumberLower;
 
-        // Registered certificates are kept as an audit record.
+        allow update, delete: if false;
+      }
+
+      // ---------------------------------------
+      // CERTIFICATE UNIQUE INDEXES
+      // ---------------------------------------
+
+      match /certificateIndexes/{indexId} {
+
+        allow read: if isMember(orgId);
+
+        allow create: if isMember(orgId)
+          && request.resource.data.keys().hasOnly([
+            "certificateId",
+            "certificateNumberLower",
+            "createdAt"
+          ])
+          && request.resource.data.keys().hasAll([
+            "certificateId",
+            "certificateNumberLower",
+            "createdAt"
+          ])
+          && request.resource.data.certificateId is string
+          && request.resource.data.certificateNumberLower is string
+          && request.resource.data.certificateNumberLower.size() > 0
+          && request.resource.data.createdAt is timestamp
+          && existsAfter(certificatePath(
+            orgId,
+            request.resource.data.certificateId
+          ))
+          && getAfter(certificatePath(
+            orgId,
+            request.resource.data.certificateId
+          )).data.certificateIndexId == indexId
+          && getAfter(certificatePath(
+            orgId,
+            request.resource.data.certificateId
+          )).data.certificateNumberLower ==
+            request.resource.data.certificateNumberLower;
+
         allow update, delete: if false;
       }
     }

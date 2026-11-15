@@ -1,6 +1,14 @@
 
 import { useEffect, useState } from "react";
-import { supabase } from "./supabaseClient";
+import { subscribeToAuthChanges, registerWithEmail, loginWithEmail, loginWithGoogle, logoutUser } from "./firebaseAuth";
+import { createOrganization, getUserOrganizations } from "./organizationService";
+import {
+  loadWorkspaceData as fetchWorkspaceData,
+  addWasteRecord,
+  addProcessor,
+  addCertificate,
+  recordPickup,
+} from "./firestoreData";
 import {
   LayoutDashboard,
   Recycle,
@@ -103,7 +111,13 @@ function WasteTable({ records }) {
 }
 
 function App() {
-  const [session, setSession] = useState(null);
+  const [user, setUser] = useState(null);
+  const [organizations, setOrganizations] = useState([]);
+  const [organizationId, setOrganizationId] = useState("");
+  const [organizationName, setOrganizationName] = useState("");
+  const [organizationBusy, setOrganizationBusy] = useState(false);
+  const [organizationError, setOrganizationError] = useState("");
+  const [organizationLoading, setOrganizationLoading] = useState(false);
   const [authLoading, setAuthLoading] = useState(true);
   const [dataLoading, setDataLoading] = useState(false);
   const [authMode, setAuthMode] = useState("login");
@@ -157,84 +171,153 @@ function App() {
     notes: "",
   });
 
+  // Track Firebase authentication state, including restored sessions.
   useEffect(() => {
-    let alive = true;
-    supabase.auth.getSession().then(({ data, error }) => {
-      if (!alive) return;
-      if (error) setAuthMessage(error.message);
-      setSession(data?.session ?? null);
+    const unsubscribe = subscribeToAuthChanges((nextUser) => {
+      setUser(nextUser);
       setAuthLoading(false);
+      setAuthMessage("");
+      setOrganizationId("");
+      setOrganizations([]);
     });
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
-      setSession(nextSession);
-    });
-    return () => {
-      alive = false;
-      listener.subscription.unsubscribe();
-    };
+    return unsubscribe;
   }, []);
 
-  async function loadWorkspaceData() {
-    if (!session?.user?.id) return;
-    setDataLoading(true);
-    setDataError("");
-    const [wasteResult, processorResult, collectionResult, certificateResult] = await Promise.all([
-      supabase.from("waste_records").select("*").order("date", { ascending: false }),
-      supabase.from("processors").select("*").order("created_at", { ascending: true }),
-      supabase.from("collections").select("*").order("date", { ascending: false }),
-      supabase.from("certificates").select("*").order("issue_date", { ascending: false }),
-    ]);
-    const failed = [wasteResult, processorResult, collectionResult, certificateResult].find((result) => result.error);
-    if (failed) {
-      setDataError(failed.error.message);
-      setDataLoading(false);
-      return;
-    }
-    setRecords((wasteResult.data || []).map((row) => ({
-      id: row.id, date: row.date, type: row.type, amount: Number(row.amount),
-      collectedAmount: Number(row.collected_amount || 0), status: row.status, notes: row.notes || "",
-    })));
-    setProcessors((processorResult.data || []).map((row) => ({
-      id: row.id, name: row.name, contact: row.contact || "", phone: row.phone || "",
-      address: row.address || "", method: row.method, acceptedWaste: row.accepted_waste || [],
-    })));
-    setCollections((collectionResult.data || []).map((row) => ({
-      id: row.id, wasteRecordId: row.waste_record_id, wasteDate: row.waste_date,
-      wasteType: row.waste_type, date: row.date, amount: Number(row.amount),
-      collector: row.collector || "", reference: row.reference || "",
-      processorId: row.processor_id, processorName: row.processor_name || "",
-    })));
-    setCertificates((certificateResult.data || []).map((row) => ({
-      id: row.id, certificateNumber: row.certificate_number, issuer: row.issuer,
-      issueDate: row.issue_date, complianceYear: String(row.compliance_year),
-      quantity: Number(row.quantity), reference: row.reference || "", notes: row.notes || "",
-    })));
-    setDataLoading(false);
-  }
-
+  // Find the workspaces the signed-in user belongs to.
   useEffect(() => {
-    if (session?.user?.id) loadWorkspaceData();
-    else {
-      setRecords([]); setCollections([]); setProcessors([]); setCertificates([]);
+    let active = true;
+
+    async function loadOrganizations() {
+      if (!user?.uid) {
+        setOrganizations([]);
+        setOrganizationId("");
+        setOrganizationLoading(false);
+        setRecords([]);
+        setCollections([]);
+        setProcessors([]);
+        setCertificates([]);
+        return;
+      }
+
+      setOrganizationLoading(true);
+      setOrganizationError("");
+      try {
+        const memberships = await getUserOrganizations(user.uid);
+        if (!active) return;
+        setOrganizations(memberships);
+        if (memberships.length === 1) setOrganizationId(memberships[0].id);
+        else setOrganizationId("");
+      } catch (error) {
+        if (active) setOrganizationError(error.message || "Could not load your organisations.");
+      } finally {
+        if (active) setOrganizationLoading(false);
+      }
     }
-  }, [session?.user?.id]);
+
+    loadOrganizations();
+    return () => { active = false; };
+  }, [user?.uid]);
+
+  // Only read business data after an organisation workspace is selected.
+  useEffect(() => {
+    let active = true;
+
+    async function loadData() {
+      if (!user?.uid || !organizationId) {
+        setRecords([]);
+        setCollections([]);
+        setProcessors([]);
+        setCertificates([]);
+        return;
+      }
+
+      setDataLoading(true);
+      setDataError("");
+      try {
+        const workspace = await fetchWorkspaceData(organizationId);
+        if (!active) return;
+        setRecords(workspace.records || []);
+        setProcessors(workspace.processors || []);
+        setCollections(workspace.collections || []);
+        setCertificates(workspace.certificates || []);
+      } catch (error) {
+        if (active) setDataError(error.message || "Could not load workspace data.");
+      } finally {
+        if (active) setDataLoading(false);
+      }
+    }
+
+    loadData();
+    return () => { active = false; };
+  }, [user?.uid, organizationId]);
+
+  async function refreshWorkspaceData() {
+    if (!organizationId) return;
+    setDataError("");
+    try {
+      const workspace = await fetchWorkspaceData(organizationId);
+      setRecords(workspace.records || []);
+      setProcessors(workspace.processors || []);
+      setCollections(workspace.collections || []);
+      setCertificates(workspace.certificates || []);
+    } catch (error) {
+      setDataError(error.message || "Could not refresh workspace data.");
+      throw error;
+    }
+  }
 
   async function handleAuthSubmit(event) {
     event.preventDefault();
-    setAuthBusy(true); setAuthMessage("");
-    const action = authMode === "login"
-      ? supabase.auth.signInWithPassword({ email: authEmail.trim(), password: authPassword })
-      : supabase.auth.signUp({ email: authEmail.trim(), password: authPassword });
-    const { data, error } = await action;
-    if (error) setAuthMessage(error.message);
-    else if (authMode === "signup" && !data.session) setAuthMessage("Account created. Check your email to confirm your address, then sign in.");
-    else setAuthMessage(authMode === "signup" ? "Account created successfully." : "Signed in successfully.");
-    setAuthBusy(false);
+    setAuthBusy(true);
+    setAuthMessage("");
+    try {
+      if (authMode === "login") await loginWithEmail(authEmail, authPassword);
+      else await registerWithEmail(authEmail, authPassword);
+      // The Firebase auth-state listener updates the user state.
+    } catch (error) {
+      setAuthMessage(error.message || "Authentication failed. Please try again.");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function handleGoogleSignIn() {
+    setAuthBusy(true);
+    setAuthMessage("");
+    try {
+      await loginWithGoogle();
+    } catch (error) {
+      setAuthMessage(error.message || "Google sign-in failed. Please try again.");
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function handleCreateOrganization(event) {
+    event.preventDefault();
+    if (!user) return;
+    setOrganizationBusy(true);
+    setOrganizationError("");
+    try {
+      const organization = await createOrganization(user, organizationName);
+      setOrganizations([organization]);
+      setOrganizationId(organization.id);
+      setOrganizationName("");
+    } catch (error) {
+      setOrganizationError(error.message || "Could not create the organisation.");
+    } finally {
+      setOrganizationBusy(false);
+    }
   }
 
   async function handleSignOut() {
-    const { error } = await supabase.auth.signOut();
-    if (error) alert(error.message);
+    try {
+      await logoutUser();
+      setOrganizationId("");
+      setOrganizations([]);
+    } catch (error) {
+      alert(error.message || "Could not sign out.");
+    }
   }
 
   // Calculate statistics from the records
@@ -413,13 +496,13 @@ function App() {
       return;
     }
 
-    const { error } = await supabase.from("waste_records").insert({
-      date: formData.date, type: formData.type, amount: quantity,
-      collected_amount: 0, status: "Pending", notes: formData.notes.trim(),
-    });
-    if (error) { alert(`Could not save waste record: ${error.message}`); return; }
-    await loadWorkspaceData();
-    setShowForm(false);
+    try {
+      await addWasteRecord(organizationId, { ...formData, amount: quantity });
+      await refreshWorkspaceData();
+      setShowForm(false);
+    } catch (error) {
+      alert(`Could not save waste record: ${error.message}`);
+    }
   }
 
   function openCollectionForm() {
@@ -474,13 +557,13 @@ function App() {
       return;
     }
 
-    const { error } = await supabase.from("processors").insert({
-      name: processorData.name.trim(), contact: processorData.contact.trim(),
-      phone: processorData.phone.trim(), address: processorData.address.trim(),
-      method: processorData.method, accepted_waste: processorData.acceptedWaste,
-    });
-    if (error) { alert(`Could not save processor: ${error.message}`); return; }
-    await loadWorkspaceData();
+    try {
+      await addProcessor(organizationId, processorData);
+      await refreshWorkspaceData();
+    } catch (error) {
+      alert(`Could not save processor: ${error.message}`);
+      return;
+    }
     setProcessorData({
       name: "",
       contact: "",
@@ -528,14 +611,18 @@ function App() {
       return;
     }
 
-    const { error } = await supabase.from("certificates").insert({
-      certificate_number: certificateNumber, issuer: certificateData.issuer.trim(),
-      issue_date: certificateData.issueDate, compliance_year: Number(certificateData.complianceYear),
-      quantity, reference: certificateData.reference.trim(), notes: certificateData.notes.trim(),
-    });
-    if (error) { alert(`Could not save certificate: ${error.message}`); return; }
-    await loadWorkspaceData();
-    setShowCertificateForm(false);
+    try {
+      await addCertificate(organizationId, {
+        ...certificateData,
+        certificateNumber,
+        quantity,
+        complianceYear: Number(certificateData.complianceYear),
+      });
+      await refreshWorkspaceData();
+      setShowCertificateForm(false);
+    } catch (error) {
+      alert(`Could not save certificate: ${error.message}`);
+    }
   }
 
   async function handlePickupSubmit(event) {
@@ -563,36 +650,79 @@ function App() {
       return;
     }
 
-    const { error } = await supabase.rpc("record_pickup", {
-      p_waste_record_id: record.id,
-      p_processor_id: receivingProcessor.id,
-      p_date: pickupData.date,
-      p_amount: quantity,
-      p_collector: pickupData.collector.trim(),
-      p_reference: pickupData.reference.trim(),
-    });
-    if (error) { alert(`Could not record pickup: ${error.message}`); return; }
-    await loadWorkspaceData();
-    setShowCollectionForm(false);
+    try {
+      await recordPickup(organizationId, { ...pickupData, amount: quantity });
+      await refreshWorkspaceData();
+      setShowCollectionForm(false);
+    } catch (error) {
+      alert(`Could not record pickup: ${error.message}`);
+    }
   }
 
-  if (authLoading) return <div className="auth-screen"><div className="auth-card"><h1>ecoloop</h1><p>Checking your session…</p></div></div>;
+  if (authLoading) {
+    return <div className="auth-screen"><div className="auth-card"><h1>ecoloop</h1><p>Checking your account…</p></div></div>;
+  }
 
-  if (!session) return (
+  if (!user) return (
     <div className="auth-screen">
       <form className="auth-card" onSubmit={handleAuthSubmit}>
         <div className="auth-brand"><Recycle size={28}/><span>ecoloop</span></div>
         <p className="auth-kicker">WASTE INTELLIGENCE</p>
-        <h1>{authMode === "login" ? "Welcome back" : "Create your workspace account"}</h1>
-        <p className="auth-description">Sign in to securely access your waste records, collections, processors, certificates and reports.</p>
+        <h1>{authMode === "login" ? "Welcome back" : "Create your account"}</h1>
+        <p className="auth-description">Sign in to securely access your organisation's waste records, collections, processors, certificates and reports.</p>
         <label htmlFor="auth-email">Email address</label>
         <input id="auth-email" type="email" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} required autoComplete="email" />
         <label htmlFor="auth-password">Password</label>
         <input id="auth-password" type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} required minLength={6} autoComplete={authMode === "login" ? "current-password" : "new-password"} />
         {authMessage && <p className="auth-message">{authMessage}</p>}
-        <button className="primary-button auth-submit" type="submit" disabled={authBusy}>{authBusy ? "Please wait…" : authMode === "login" ? "Sign in" : "Create account"}</button>
-        <button className="auth-switch" type="button" onClick={() => { setAuthMode(authMode === "login" ? "signup" : "login"); setAuthMessage(""); }}>{authMode === "login" ? "New to Ecoloop? Create an account" : "Already have an account? Sign in"}</button>
+        <button className="primary-button auth-submit" type="submit" disabled={authBusy}>{authBusy ? "Please wait…" : authMode === "login" ? "Sign in with email" : "Create account with email"}</button>
+        <div className="auth-divider"><span>OR</span></div>
+        <button className="google-button" type="button" onClick={handleGoogleSignIn} disabled={authBusy}>
+          <span className="google-mark">G</span>Continue with Google
+        </button>
+        <button className="auth-switch" type="button" onClick={() => { setAuthMode(authMode === "login" ? "signup" : "login"); setAuthMessage(""); }}>{authMode === "login" ? "New to EcoLoop? Create an account" : "Already have an account? Sign in"}</button>
       </form>
+    </div>
+  );
+
+  if (organizationLoading) {
+    return <div className="auth-screen"><div className="auth-card"><h1>ecoloop</h1><p>Loading your organisations…</p></div></div>;
+  }
+
+  if (!organizationId) return (
+    <div className="auth-screen">
+      <div className="auth-card">
+        <div className="auth-brand"><Recycle size={28}/><span>ecoloop</span></div>
+        <p className="auth-kicker">WORKSPACE SETUP</p>
+        {organizations.length > 1 ? (
+          <>
+            <h1>Choose your organisation</h1>
+            <p className="auth-description">Select the workspace you want to open.</p>
+            <div className="organization-list">
+              {organizations.map((organization) => (
+                <button className="organization-option" type="button" key={organization.id} onClick={() => setOrganizationId(organization.id)}>
+                  <Building2 size={19}/>
+                  <span><strong>{organization.organizationName || organization.name || "Organisation"}</strong><small>{organization.role || "Member"}</small></span>
+                  <ArrowUpRight size={17}/>
+                </button>
+              ))}
+            </div>
+          </>
+        ) : (
+          <>
+            <h1>Create your organisation</h1>
+            <p className="auth-description">Your account is ready. Create an organisation workspace to start recording waste and managing collections. You will be its initial admin.</p>
+            <form onSubmit={handleCreateOrganization}>
+              <label htmlFor="organization-name">Organisation name</label>
+              <input id="organization-name" type="text" value={organizationName} onChange={(event) => setOrganizationName(event.target.value)} placeholder="e.g. College Mess" required maxLength={100} />
+              {organizationError && <p className="auth-message">{organizationError}</p>}
+              <button className="primary-button auth-submit" type="submit" disabled={organizationBusy}>{organizationBusy ? "Creating workspace…" : "Create workspace"}</button>
+            </form>
+          </>
+        )}
+        {organizationError && organizations.length > 1 && <p className="auth-message">{organizationError}</p>}
+        <button className="auth-switch" type="button" onClick={handleSignOut}>Sign out</button>
+      </div>
     </div>
   );
 
@@ -652,9 +782,9 @@ function App() {
           </button>
 
           <div className="profile">
-            <div className="avatar">{(session?.user?.email || "U").slice(0, 1).toUpperCase()}</div>
+            <div className="avatar">{(user?.email || "U").slice(0, 1).toUpperCase()}</div>
             <div>
-              <strong>{session?.user?.email || "Workspace"}</strong>
+              <strong>{user?.email || "Workspace"}</strong>
               <span>Authenticated workspace</span>
             </div>
           </div>
@@ -664,11 +794,11 @@ function App() {
       {/* Main content */}
       <main className="main-content">
         {dataLoading && <div className="data-status">Syncing your workspace data…</div>}
-        {dataError && <div className="data-error">Database error: {dataError}. Check your Supabase setup and table policies.</div>}
+        {dataError && <div className="data-error">Database error: {dataError}. Check your Firestore rules and connection.</div>}
 
         <header className="topbar">
           <div>
-            <p className="breadcrumb">Workspace / {activePage}</p>
+            <p className="breadcrumb">{organizations.find((item) => item.id === organizationId)?.organizationName || organizations.find((item) => item.id === organizationId)?.name || "Workspace"} / {activePage}</p>
             <h1>{activePage}</h1>
           </div>
 
@@ -681,7 +811,7 @@ function App() {
               <span></span>
             </button>
 
-            <span className="account-email">{session?.user?.email}</span>
+            <span className="account-email">{user?.email}</span>
             <button className="secondary-button signout-button" onClick={handleSignOut}>Sign out</button>
           </div>
         </header>
