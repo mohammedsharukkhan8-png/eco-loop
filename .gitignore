@@ -23,7 +23,10 @@ dist-ssr
 *.sln
 *.sw?
 
-# Environment variables and secrets
 .env
 .env.*
 !.env.example
+
+.agents/
+.claude/
+skills-lock.json
